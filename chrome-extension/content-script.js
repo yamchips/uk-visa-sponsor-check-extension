@@ -5,6 +5,19 @@
   const DETAIL_HOST_CLASS = "uvsc-detail-badge-host";
   const STATUS_ROOT_CLASS = "uvsc-status";
   const DISMISS_BUTTON_SELECTOR = 'button[aria-label*="Dismiss"][aria-label*="job"]';
+  const LEFT_PANEL_CONTAINER_SELECTORS = [
+    ".jobs-search-results-list",
+    ".jobs-search-results-list__list",
+    ".jobs-search-results-list__list-container",
+    ".scaffold-layout__list",
+    ".scaffold-layout__list-container",
+    '[data-test-reusablesearch__results-list]'
+  ];
+  const LEFT_PANEL_CARD_SELECTORS = [
+    ".jobs-search-results-list > li",
+    ".scaffold-layout__list-container > li",
+    ".scaffold-layout__list > li"
+  ];
   const EXTENSION_VERSION = chrome.runtime?.getManifest?.().version || "dev";
 
   const state = {
@@ -18,6 +31,7 @@
     matchResultByKey: new Map(),
     observer: null,
     eventTeardown: [],
+    lastDiscoveryDebugSignature: "",
     status: {
       mode: "booting",
       message: "Starting"
@@ -217,9 +231,12 @@
       const company = extractCardCompanyName(current);
 
       if (title && company) {
-        fallbackRoot = current;
+        if (!fallbackRoot) {
+          fallbackRoot = current;
+        }
         if (countDismissButtons(current) === 1) {
           bestSingleDismissRoot = current;
+          break;
         }
       }
 
@@ -230,31 +247,143 @@
     return createCardEntry(bestSingleDismissRoot || fallbackRoot, button);
   }
 
+  function scorePotentialCardRoot(element) {
+    if (!(element instanceof HTMLElement) || isInsideDetailPanel(element)) {
+      return -Infinity;
+    }
+
+    const dismissButtons = countDismissButtons(element);
+    const jobLinks = countJobLinks(element);
+    const title = extractCardTitle(element);
+    const company = extractCardCompanyName(element);
+    let score = 0;
+
+    if (dismissButtons === 1) {
+      score += 8;
+    } else if (dismissButtons > 1) {
+      score -= dismissButtons * 6;
+    }
+
+    if (jobLinks === 1) {
+      score += 6;
+    } else if (jobLinks > 1) {
+      score -= jobLinks * 4;
+    }
+
+    if (element.hasAttribute("data-job-id") || element.hasAttribute("data-occludable-job-id")) {
+      score += 4;
+    }
+
+    if (title) {
+      score += 4;
+    }
+
+    if (company) {
+      score += 4;
+    }
+
+    if (title && company) {
+      score += 8;
+    }
+
+    return score;
+  }
+
+  function getElementChildren(element) {
+    return Array.from(element?.children || []).filter((child) => child instanceof HTMLElement);
+  }
+
+  function expandLeftPanelChildSets(container) {
+    const childSets = [];
+    const directChildren = getElementChildren(container);
+
+    if (directChildren.length) {
+      childSets.push(directChildren);
+    }
+
+    for (const child of directChildren.slice(0, 4)) {
+      const grandchildren = getElementChildren(child);
+      if (grandchildren.length > 1) {
+        childSets.push(grandchildren);
+      }
+    }
+
+    return childSets;
+  }
+
+  function findTopLevelLeftPanelCandidates() {
+    const containers = collectUniqueElements(LEFT_PANEL_CONTAINER_SELECTORS).filter(
+      (element) => !isInsideDetailPanel(element)
+    );
+    let bestMatches = [];
+    let bestScore = -Infinity;
+
+    for (const container of containers) {
+      for (const childSet of expandLeftPanelChildSets(container)) {
+        const filteredChildren = childSet.filter((child) => !isInsideDetailPanel(child));
+        const matches = filteredChildren.filter((child) => scorePotentialCardRoot(child) >= 8);
+        const score = matches.length * 20 - Math.abs(filteredChildren.length - matches.length);
+
+        if (matches.length > bestMatches.length || (matches.length === bestMatches.length && score > bestScore)) {
+          bestMatches = matches;
+          bestScore = score;
+        }
+      }
+    }
+
+    const seen = new Set();
+    const results = [];
+
+    for (const match of bestMatches) {
+      if (!seen.has(match)) {
+        seen.add(match);
+        results.push(match);
+      }
+    }
+
+    return results;
+  }
+
   function findJobCards() {
     const entries = [];
+    const seenEntries = new Set();
 
-    for (const dismissButton of document.querySelectorAll(DISMISS_BUTTON_SELECTOR)) {
-      const entry = findCardEntryFromDismissButton(dismissButton);
+    function addEntry(entry) {
       if (!entry) {
-        continue;
+        return;
       }
 
+      const entryKey = entry.root || entry.matchRoot;
+      if (!entryKey || seenEntries.has(entryKey)) {
+        return;
+      }
+
+      seenEntries.add(entryKey);
       entries.push(entry);
     }
 
-    if (entries.length) {
+    const topLevelCandidates = findTopLevelLeftPanelCandidates();
+    if (topLevelCandidates.length) {
+      for (const candidate of topLevelCandidates) {
+        addEntry(createCardEntry(candidate, candidate.querySelector(DISMISS_BUTTON_SELECTOR)));
+      }
+
       return entries;
     }
 
+    for (const dismissButton of document.querySelectorAll(DISMISS_BUTTON_SELECTOR)) {
+      addEntry(findCardEntryFromDismissButton(dismissButton));
+    }
+
     const fallbackCandidates = collectUniqueElements([
+      ...LEFT_PANEL_CARD_SELECTORS,
       ".jobs-search-results__list-item",
       ".job-card-container",
       "[data-job-id]",
       "[data-occludable-job-id]",
       '[data-entity-urn*="jobPosting"]',
       ".jobs-search-results-list li",
-      ".scaffold-layout__list-container li",
-      ".scaffold-layout__list > li"
+      ".scaffold-layout__list-container li"
     ]);
 
     const seen = new Set();
@@ -266,22 +395,27 @@
       }
 
       const entry = createCardEntry(candidate, candidate.querySelector(DISMISS_BUTTON_SELECTOR));
-      if (!entry || seen.has(entry.matchRoot)) {
+      const entryKey = entry?.root || entry?.matchRoot;
+      if (!entry || seen.has(entryKey)) {
         continue;
       }
 
-      seen.add(entry.matchRoot);
+      seen.add(entryKey);
       fallbackEntries.push(entry);
     }
 
-    return fallbackEntries;
+    for (const entry of fallbackEntries) {
+      addEntry(entry);
+    }
+
+    return entries;
   }
 
   function getCardDebugSnapshot() {
     const jobViewLinks = document.querySelectorAll('a[href*="/jobs/view/"]').length;
     const currentJobLinks = document.querySelectorAll('a[href*="currentJobId="]').length;
     const dismissButtons = document.querySelectorAll(DISMISS_BUTTON_SELECTOR).length;
-    const listCandidates = document.querySelectorAll(".jobs-search-results-list li, .scaffold-layout__list-container li").length;
+    const listCandidates = findTopLevelLeftPanelCandidates().length;
     const jobIdCandidates = document.querySelectorAll("[data-job-id], [data-occludable-job-id]").length;
 
     return {
@@ -311,7 +445,7 @@
     const lines = [];
 
     for (const rawLine of rawText.split(/\r?\n+/)) {
-      const text = normalizeComparableText(rawLine);
+      const text = collapseRepeatedText(rawLine);
       if (!text || seen.has(text)) {
         continue;
       }
@@ -343,6 +477,41 @@
       .trim();
   }
 
+  function collapseRepeatedText(text) {
+    const normalized = normalizeComparableText(text);
+    const tokens = normalized.split(" ").filter(Boolean);
+
+    if (tokens.length >= 2 && tokens.length % 2 === 0) {
+      const midpoint = tokens.length / 2;
+      const firstHalf = tokens.slice(0, midpoint).join(" ");
+      const secondHalf = tokens.slice(midpoint).join(" ");
+
+      if (firstHalf === secondHalf) {
+        return firstHalf;
+      }
+    }
+
+    return normalized;
+  }
+
+  function looksLikeRelativeTime(text) {
+    return /^(?:just now|yesterday|\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago)$/i.test(
+      normalizeComparableText(text)
+    );
+  }
+
+  function looksLikeSearchChromeText(text) {
+    const normalized = normalizeComparableText(text).toLowerCase();
+
+    return (
+      /^\d+\+?\s+results$/.test(normalized) ||
+      normalized === "get job alerts for this search" ||
+      normalized === "how promoted jobs are ranked" ||
+      normalized === "job alerts" ||
+      normalized === "set alert"
+    );
+  }
+
   function looksLikeCompensation(text) {
     return /(?:£|\$|€|usd|gbp|eur|salary|\b\d+(?:\.\d+)?\s*K\b|\/(?:yr|year|hr|hour|day|month))/i.test(text);
   }
@@ -350,10 +519,25 @@
   function isLikelyMetaText(text) {
     return (
       !text ||
+      looksLikeRelativeTime(text) ||
+      looksLikeSearchChromeText(text) ||
       looksLikeCompensation(text) ||
       /\b(viewed|posted|posted on|be an early applicant|applicants?|responses managed|promoted by|school alumni|connections work here|clicked apply|show all|show more|save|dismiss|apply|follow|helpful|learn more|premium|beta|people you can reach out to|match details|unable to load|reactivate premium|i['’]m interested|more options)\b/i.test(
         text
       )
+    );
+  }
+
+  function textsOverlap(left, right) {
+    const normalizedLeft = collapseRepeatedText(left);
+    const normalizedRight = collapseRepeatedText(right);
+
+    return Boolean(
+      normalizedLeft &&
+        normalizedRight &&
+        (normalizedLeft === normalizedRight ||
+          normalizedLeft.includes(normalizedRight) ||
+          normalizedRight.includes(normalizedLeft))
     );
   }
 
@@ -398,7 +582,7 @@
         continue;
       }
 
-      const text = normalizeComparableText(extractText(element));
+      const text = collapseRepeatedText(extractText(element));
       if (!text || seen.has(text)) {
         continue;
       }
@@ -472,7 +656,7 @@
       'h1, h2, h3, h4'
     ]) {
       for (const element of card.querySelectorAll(selector)) {
-        const text = normalizeComparableText(extractText(element));
+        const text = collapseRepeatedText(extractText(element));
         if (isLikelyStandaloneTitle(text)) {
           return text;
         }
@@ -483,7 +667,7 @@
     if (jobLink) {
       const jobLinkCandidates = collectOrderedTextCandidates(jobLink, "h1, h2, h3, h4, p, span, strong, a");
       if (!jobLinkCandidates.length) {
-        const directText = normalizeComparableText(extractText(jobLink));
+        const directText = collapseRepeatedText(extractText(jobLink));
         if (isLikelyStandaloneTitle(directText)) {
           return directText;
         }
@@ -526,8 +710,8 @@
       '[class*="subtitle"]'
     ]) {
       for (const element of card.querySelectorAll(selector)) {
-        const text = normalizeComparableText(extractText(element));
-        if (text && text !== title && isLikelyCompanyName(text) && !looksLikeLocation(text)) {
+        const text = collapseRepeatedText(extractText(element));
+        if (text && !textsOverlap(text, title) && isLikelyCompanyName(text) && !looksLikeLocation(text)) {
           return {
             name: text,
             element: findBestTextAnchor(element, text) || element
@@ -547,7 +731,7 @@
     }
 
     for (const { text, element } of orderedCandidates.slice(startIndex)) {
-      if (!text || text === title || (title && text.includes(title))) {
+      if (!text || textsOverlap(text, title)) {
         continue;
       }
 
@@ -562,7 +746,7 @@
     }
 
     for (const { text, element } of orderedCandidates) {
-      if (!text || text === title || (title && text.includes(title))) {
+      if (!text || textsOverlap(text, title)) {
         continue;
       }
 
@@ -587,7 +771,7 @@
     }
 
     for (const text of visibleLines.slice(lineStartIndex)) {
-      if (!text || text === title || (title && text.includes(title))) {
+      if (!text || textsOverlap(text, title)) {
         continue;
       }
 
@@ -692,7 +876,7 @@
 
     for (const selector of ["h1", "h2", "h3", "h4", '[class*="title"]']) {
       for (const element of detailRoot.querySelectorAll(selector)) {
-        const text = normalizeComparableText(extractText(element));
+        const text = collapseRepeatedText(extractText(element));
         if (isLikelyStandaloneTitle(text)) {
           return text;
         }
@@ -715,7 +899,7 @@
 
     for (const selector of ["h1", "h2", "h3", "h4", '[class*="title"]']) {
       for (const element of detailRoot.querySelectorAll(selector)) {
-        const text = normalizeComparableText(extractText(element));
+        const text = collapseRepeatedText(extractText(element));
         if (isLikelyStandaloneTitle(text)) {
           return findBestTextAnchor(element, text) || element;
         }
@@ -749,8 +933,8 @@
       'a[href*="/company/"]'
     ]) {
       for (const element of detailRoot.querySelectorAll(selector)) {
-        const text = normalizeComparableText(extractText(element));
-        if (text && text !== detailTitle && isLikelyCompanyName(text) && !looksLikeLocation(text)) {
+        const text = collapseRepeatedText(extractText(element));
+        if (text && !textsOverlap(text, detailTitle) && isLikelyCompanyName(text) && !looksLikeLocation(text)) {
           return {
             name: text,
             element: findBestTextAnchor(element, text) || element,
@@ -763,7 +947,7 @@
     const orderedCandidates = collectOrderedTextCandidates(detailRoot, "p, a, span, strong, h1, h2, h3, h4, div").slice(0, 40);
 
     for (const { text, element } of orderedCandidates) {
-      if (!text || text === detailTitle || (detailTitle && text.includes(detailTitle))) {
+      if (!text || textsOverlap(text, detailTitle)) {
         continue;
       }
 
@@ -1286,14 +1470,64 @@
 
   function scanLinkedInJobsPage() {
     const cards = findJobCards();
+    const leftPanelCandidates = findTopLevelLeftPanelCandidates();
     const activeEntry = findActiveCard(cards);
     const activeCard = activeEntry?.matchRoot || activeEntry?.root || null;
     const detailInfo = extractDetailCompanyInfo(activeCard);
     const detailCompanyName = detailInfo.name;
     const debug = getCardDebugSnapshot();
+    const debugJobs = cards.slice(0, 25).map((entry, index) => {
+      const card = entry.matchRoot || entry.root;
+      const link = card.querySelector('a[href*="/jobs/view/"], a[href*="currentJobId="]');
+
+      return {
+        index: index + 1,
+        jobKey: extractJobKey(card),
+        title: extractCardTitle(card),
+        company: extractCardCompanyName(card),
+        active: isActiveCard(entry.root),
+        href: link?.href || "",
+        textPreview: extractVisibleTextLines(card).slice(0, 4).join(" | ")
+      };
+    });
     let annotatedCount = 0;
     const locationJobKey = extractJobKeyFromLocation();
     const cardLayer = resetCardBadgeLayer();
+
+    console.log(`[VisaSponsorChecker] scanLinkedInJobsPage found ${cards.length} cards`);
+    console.table(debugJobs);
+
+    const discoverySignature = `${leftPanelCandidates.length}:${cards.length}`;
+    if (leftPanelCandidates.length !== cards.length && state.lastDiscoveryDebugSignature !== discoverySignature) {
+      state.lastDiscoveryDebugSignature = discoverySignature;
+
+      console.log(
+        `[VisaSponsorChecker] discovery mismatch: ${leftPanelCandidates.length} top-level list candidates vs ${cards.length} extracted cards`
+      );
+      console.table(
+        leftPanelCandidates.slice(0, 40).map((candidate, index) => {
+          const normalized = normalizeCardElement(candidate) || candidate;
+          const accepted = cards.some(
+            (entry) =>
+              entry.root === candidate ||
+              entry.root === normalized ||
+              entry.matchRoot === candidate ||
+              entry.matchRoot === normalized
+          );
+
+          return {
+            index: index + 1,
+            accepted,
+            looksLikeJobCard: looksLikeJobCard(candidate),
+            jobLinks: countJobLinks(candidate),
+            dismissButtons: countDismissButtons(candidate),
+            title: extractCardTitle(candidate),
+            company: extractCardCompanyName(candidate),
+            textPreview: extractVisibleTextLines(candidate).slice(0, 4).join(" | ")
+          };
+        })
+      );
+    }
 
     if (locationJobKey) {
       state.selectedJobKey = locationJobKey;

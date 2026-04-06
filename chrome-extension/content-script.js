@@ -927,27 +927,17 @@
   }
 
   function ensureCardBadgeHost(card, layer, anchorButton = null) {
-    const dismissButton =
-      (anchorButton instanceof HTMLElement && anchorButton) || card.querySelector(DISMISS_BUTTON_SELECTOR);
-    if (dismissButton instanceof HTMLElement && dismissButton.parentElement instanceof HTMLElement) {
-      const existingSiblingHost = dismissButton.parentElement.querySelector(`:scope > .${CARD_HOST_CLASS}.is-inline-anchor`);
-      if (existingSiblingHost instanceof HTMLElement) {
-        return existingSiblingHost;
-      }
-
-      const host = document.createElement("div");
-      host.className = `${CARD_HOST_CLASS} is-inline-anchor`;
-      dismissButton.parentElement.insertBefore(host, dismissButton);
-      return host;
-    }
-
     const host = document.createElement("div");
     host.className = CARD_HOST_CLASS;
+    const dismissButton =
+      (anchorButton instanceof HTMLElement && anchorButton) || card.querySelector(DISMISS_BUTTON_SELECTOR);
     const anchor = dismissButton instanceof HTMLElement ? dismissButton : card;
-    const rect = anchor.getBoundingClientRect();
+    const anchorRect = anchor.getBoundingClientRect();
+    const cardRect = card.getBoundingClientRect();
     const badgeSize = 10;
-    const top = Math.max(8, rect.top + Math.max(0, (rect.height - badgeSize) / 2));
-    const left = Math.max(8, rect.left - badgeSize - 18);
+    const top = Math.max(8, anchorRect.top + Math.max(0, (anchorRect.height - badgeSize) / 2));
+    const fallbackLeft = cardRect.right - badgeSize - 24;
+    const left = Math.max(8, (dismissButton instanceof HTMLElement ? anchorRect.left - badgeSize - 14 : fallbackLeft));
 
     host.style.left = `${left}px`;
     host.style.top = `${top}px`;
@@ -985,12 +975,6 @@
   }
 
   function ensureDetailBadgeHost(detailRoot, anchorElement = null) {
-    const titleAnchor = findDetailTitleElement(detailRoot);
-    const anchor =
-      (titleAnchor instanceof HTMLElement && titleAnchor) ||
-      (anchorElement instanceof HTMLElement && anchorElement) ||
-      findDetailBadgeAnchor(detailRoot);
-
     let host = document.documentElement.querySelector(`:scope > .${DETAIL_HOST_CLASS}`);
     if (!host) {
       host = document.createElement("span");
@@ -998,9 +982,10 @@
       document.documentElement.appendChild(host);
     }
 
-    const targetRect = (anchor instanceof HTMLElement ? anchor : detailRoot).getBoundingClientRect();
-    const top = Math.max(12, targetRect.top + 8);
-    const left = Math.min(window.innerWidth - 20, targetRect.right + 8);
+    const detailRect = detailRoot.getBoundingClientRect();
+    const badgeSize = 10;
+    const top = Math.max(12, detailRect.top + 20);
+    const left = Math.max(12, detailRect.right - badgeSize - 60);
 
     host.style.left = `${left}px`;
     host.style.top = `${top}px`;

@@ -1,0 +1,10 @@
+{
+  "name": "linkedin-uk-visa-sponsor-checker",
+  "version": "0.1.14",
+  "private": true,
+  "description": "Chrome extension that labels LinkedIn jobs by UK visa sponsorship support using the official sponsor list.",
+  "scripts": {
+    "build:data": "node scripts/build-sponsors.cjs",
+    "test:matcher": "node scripts/test-matcher.cjs"
+  }
+}

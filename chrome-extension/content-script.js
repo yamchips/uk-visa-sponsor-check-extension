@@ -124,6 +124,33 @@
     return root.querySelectorAll(DISMISS_BUTTON_SELECTOR).length;
   }
 
+  function extractDismissTitleFromAriaLabel(label) {
+    const text = String(label || "").trim();
+    const match = text.match(/^Dismiss\s+(.+?)\s+job$/i);
+    return match ? collapseRepeatedText(match[1]) : "";
+  }
+
+  function getSingleDismissButton(root) {
+    if (!(root instanceof HTMLElement)) {
+      return null;
+    }
+
+    if (root.matches(DISMISS_BUTTON_SELECTOR)) {
+      return root;
+    }
+
+    const buttons = root.querySelectorAll(DISMISS_BUTTON_SELECTOR);
+    return buttons.length === 1 ? buttons[0] : null;
+  }
+
+  function findNearestLeftPanelContainer(element) {
+    if (!(element instanceof HTMLElement)) {
+      return null;
+    }
+
+    return element.closest(LEFT_PANEL_CONTAINER_SELECTORS.join(", "));
+  }
+
   function isInsideDetailPanel(element) {
     return Boolean(
       element instanceof HTMLElement &&
@@ -217,26 +244,34 @@
   }
 
   function findCardEntryFromDismissButton(button) {
+    const leftPanelContainer = findNearestLeftPanelContainer(button);
     let current = button?.parentElement || null;
-    let bestSingleDismissRoot = null;
+    let bestRoot = null;
+    let bestScore = -Infinity;
     let fallbackRoot = null;
     let depth = 0;
 
     while (current instanceof HTMLElement && depth < 14) {
+      if (leftPanelContainer && current === leftPanelContainer) {
+        break;
+      }
+
       if (isInsideDetailPanel(current)) {
         return null;
       }
 
-      const title = extractCardTitle(current);
-      const company = extractCardCompanyName(current);
+      if (countDismissButtons(current) === 1) {
+        const title = extractCardTitle(current);
+        const company = extractCardCompanyName(current);
+        const score = scorePotentialCardRoot(current) - depth;
 
-      if (title && company) {
-        if (!fallbackRoot) {
+        if ((title || company) && !fallbackRoot) {
           fallbackRoot = current;
         }
-        if (countDismissButtons(current) === 1) {
-          bestSingleDismissRoot = current;
-          break;
+
+        if (title && company && score > bestScore) {
+          bestRoot = current;
+          bestScore = score;
         }
       }
 
@@ -244,7 +279,7 @@
       depth += 1;
     }
 
-    return createCardEntry(bestSingleDismissRoot || fallbackRoot, button);
+    return createCardEntry(bestRoot || fallbackRoot, button);
   }
 
   function scorePotentialCardRoot(element) {
@@ -362,17 +397,27 @@
       entries.push(entry);
     }
 
+    const dismissButtons = Array.from(document.querySelectorAll(DISMISS_BUTTON_SELECTOR)).filter(
+      (button) => !isInsideDetailPanel(button)
+    );
+
+    for (const dismissButton of dismissButtons) {
+      addEntry(findCardEntryFromDismissButton(dismissButton));
+    }
+
+    if (entries.length) {
+      return entries;
+    }
+
     const topLevelCandidates = findTopLevelLeftPanelCandidates();
     if (topLevelCandidates.length) {
       for (const candidate of topLevelCandidates) {
         addEntry(createCardEntry(candidate, candidate.querySelector(DISMISS_BUTTON_SELECTOR)));
       }
 
-      return entries;
-    }
-
-    for (const dismissButton of document.querySelectorAll(DISMISS_BUTTON_SELECTOR)) {
-      addEntry(findCardEntryFromDismissButton(dismissButton));
+      if (entries.length) {
+        return entries;
+      }
     }
 
     const fallbackCandidates = collectUniqueElements([
@@ -643,7 +688,66 @@
     return bestCandidate;
   }
 
+  function looksLikeTrailingLocationSegment(text) {
+    const normalized = collapseRepeatedText(text);
+    if (!normalized) {
+      return false;
+    }
+
+    return (
+      looksLikeLocation(normalized) ||
+      /^[a-z][a-z .&'/:-]*\((?:hybrid|remote|on-site|onsite)\)$/i.test(normalized) ||
+      /^[a-z][a-z .&'/:-]*,\s*(?:hybrid|remote|on-site|onsite)$/i.test(normalized)
+    );
+  }
+
+  function addUniqueTitleCandidate(bucket, value) {
+    const normalized = collapseRepeatedText(value);
+    if (!normalized || bucket.includes(normalized)) {
+      return;
+    }
+
+    bucket.push(normalized);
+  }
+
+  function extractTitleCandidatesFromText(text) {
+    const normalized = collapseRepeatedText(text);
+    if (!normalized) {
+      return [];
+    }
+
+    const candidates = [];
+    const queue = [normalized];
+
+    for (const segment of normalized.split("|").map((part) => collapseRepeatedText(part)).filter(Boolean)) {
+      if (!queue.includes(segment)) {
+        queue.push(segment);
+      }
+    }
+
+    for (const candidate of queue) {
+      addUniqueTitleCandidate(candidates, candidate);
+
+      const hyphenParts = candidate.split(/\s+-\s+/).map((part) => collapseRepeatedText(part)).filter(Boolean);
+      if (hyphenParts.length > 1 && looksLikeTrailingLocationSegment(hyphenParts[hyphenParts.length - 1])) {
+        addUniqueTitleCandidate(candidates, hyphenParts.slice(0, -1).join(" - "));
+      }
+    }
+
+    return candidates;
+  }
+
   function extractCardTitle(card) {
+    const localDismissButton = getSingleDismissButton(card);
+    const normalizedCard = normalizeCardElement(card);
+    const normalizedDismissButton = localDismissButton || getSingleDismissButton(normalizedCard);
+    const dismissTitle = extractDismissTitleFromAriaLabel(normalizedDismissButton?.getAttribute("aria-label"));
+    for (const candidate of extractTitleCandidatesFromText(dismissTitle)) {
+      if (isLikelyStandaloneTitle(candidate)) {
+        return candidate;
+      }
+    }
+
     for (const selector of [
       ".job-card-list__title",
       ".job-card-list__title--link",
@@ -656,9 +760,10 @@
       'h1, h2, h3, h4'
     ]) {
       for (const element of card.querySelectorAll(selector)) {
-        const text = collapseRepeatedText(extractText(element));
-        if (isLikelyStandaloneTitle(text)) {
-          return text;
+        for (const candidate of extractTitleCandidatesFromText(extractText(element))) {
+          if (isLikelyStandaloneTitle(candidate)) {
+            return candidate;
+          }
         }
       }
     }
@@ -667,28 +772,35 @@
     if (jobLink) {
       const jobLinkCandidates = collectOrderedTextCandidates(jobLink, "h1, h2, h3, h4, p, span, strong, a");
       if (!jobLinkCandidates.length) {
-        const directText = collapseRepeatedText(extractText(jobLink));
-        if (isLikelyStandaloneTitle(directText)) {
-          return directText;
+        for (const candidate of extractTitleCandidatesFromText(extractText(jobLink))) {
+          if (isLikelyStandaloneTitle(candidate)) {
+            return candidate;
+          }
         }
       }
 
       for (const { text } of jobLinkCandidates) {
-        if (isLikelyStandaloneTitle(text)) {
-          return text;
+        for (const candidate of extractTitleCandidatesFromText(text)) {
+          if (isLikelyStandaloneTitle(candidate)) {
+            return candidate;
+          }
         }
       }
     }
 
     for (const { text } of collectOrderedTextCandidates(card, "h1, h2, h3, h4, p, span, strong, a")) {
-      if (isLikelyStandaloneTitle(text)) {
-        return text;
+      for (const candidate of extractTitleCandidatesFromText(text)) {
+        if (isLikelyStandaloneTitle(candidate)) {
+          return candidate;
+        }
       }
     }
 
     for (const text of extractVisibleTextLines(card)) {
-      if (isLikelyStandaloneTitle(text)) {
-        return text;
+      for (const candidate of extractTitleCandidatesFromText(text)) {
+        if (isLikelyStandaloneTitle(candidate)) {
+          return candidate;
+        }
       }
     }
 
@@ -796,7 +908,7 @@
   }
 
   function looksLikeLocation(text) {
-    return /\b(united kingdom|england|scotland|wales|northern ireland|hybrid|remote|on-site|onsite)\b/i.test(text) || /,/.test(text);
+    return /\b(united kingdom|england|scotland|wales|northern ireland|hybrid|remote|on-site|onsite)\b/i.test(text);
   }
 
   function detailRootHasApplyOrSave(root) {
@@ -1111,10 +1223,18 @@
   }
 
   function ensureCardBadgeHost(card, layer, anchorButton = null) {
-    const host = document.createElement("div");
-    host.className = CARD_HOST_CLASS;
     const dismissButton =
       (anchorButton instanceof HTMLElement && anchorButton) || card.querySelector(DISMISS_BUTTON_SELECTOR);
+
+    if (dismissButton instanceof HTMLElement && dismissButton.parentElement instanceof HTMLElement) {
+      const host = document.createElement("span");
+      host.className = `${CARD_HOST_CLASS} is-inline-anchor`;
+      dismissButton.parentElement.insertBefore(host, dismissButton);
+      return host;
+    }
+
+    const host = document.createElement("div");
+    host.className = CARD_HOST_CLASS;
     const anchor = dismissButton instanceof HTMLElement ? dismissButton : card;
     const anchorRect = anchor.getBoundingClientRect();
     const cardRect = card.getBoundingClientRect();
@@ -1391,12 +1511,12 @@
     const effectiveRoot = matchRoot instanceof HTMLElement ? matchRoot : card;
 
     if (isInsideDetailPanel(card) || isInsideDetailPanel(effectiveRoot)) {
-      return false;
+      return null;
     }
 
     const matchContext = buildCardMatchContext(effectiveRoot, detailCompanyName, activeCard);
     if (!matchContext) {
-      return false;
+      return null;
     }
 
     const result = getCachedMatchResult(matchContext.namesToCheck);
@@ -1410,7 +1530,7 @@
     }
     const host = ensureCardBadgeHost(card, cardLayer, anchorButton);
     upsertBadge(host, result, "job card", "dot");
-    return true;
+    return result;
   }
 
   function getSelectedDetailResult(detailInfo, activeCard, preferredResult = null) {
@@ -1491,6 +1611,7 @@
       };
     });
     let annotatedCount = 0;
+    const debugMatchBooleans = [];
     const locationJobKey = extractJobKeyFromLocation();
     const cardLayer = resetCardBadgeLayer();
 
@@ -1551,10 +1672,22 @@
     }
 
     for (const entry of cards) {
-      if (annotateCard(entry.root, detailCompanyName, activeCard, cardLayer, entry.anchor, entry.matchRoot)) {
+      const result = annotateCard(entry.root, detailCompanyName, activeCard, cardLayer, entry.anchor, entry.matchRoot);
+      debugMatchBooleans.push(Boolean(result?.matched));
+      if (result) {
         annotatedCount += 1;
       }
     }
+
+    console.log("[VisaSponsorChecker] match booleans", debugMatchBooleans);
+    console.table(
+      debugJobs.map((job, index) => ({
+        index: job.index,
+        title: job.title,
+        company: job.company,
+        matched: debugMatchBooleans[index] ?? false
+      }))
+    );
 
     annotateDetailPanel(detailInfo, activeCardResult, activeCard);
 

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn UK Visa Sponsor Checker",
-  "version": "0.1.21",
+  "version": "0.1.22",
   "description": "Labels LinkedIn jobs using the official UK visa sponsor list.",
   "content_scripts": [
     {

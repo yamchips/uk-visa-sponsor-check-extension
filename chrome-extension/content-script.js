@@ -271,7 +271,12 @@
       return null;
     }
 
-    const namesToCheck = collectUniqueStrings([cardCompanyName, ...sponsorAwareCandidates]);
+    // Trust the extracted company name first. Scanning the whole card text can
+    // surface unrelated sponsor aliases from locations or metadata, which can
+    // make duplicate companies like Evernote/Meetup diverge across rows.
+    const namesToCheck = cardCompanyName
+      ? collectUniqueStrings([cardCompanyName])
+      : collectUniqueStrings(sponsorAwareCandidates);
     const jobKey = extractJobKey(card);
 
     if (jobKey && state.detailNameByJobKey.has(jobKey)) {
